@@ -8,8 +8,9 @@ After singleSUB_SKUscraper.run() writes the singles xlsx:
 3. If any Sub-SKU is missing from singles → search NEW/Master SKU (strip HML-; 3+ segments
    drop last) on the site, scrape PDP + packaging table; write to
    Homelagance-{stamp}-multiple-subskus-sheets.xlsx (full base + scrape columns).
-4. attributes JSON: per Sub-SKU order — table row if match; else singles merge; else
-   {"sub-sku": "…"}.
+4. Web scrape ok: attributes = JSON array in Sub-SKU sheet order; each item is the full packaging
+   row when Model matches that Sub-SKU (simple normalized match), else singles merge, else {model}.
+   No table / failed scrape: same merge logic with an empty table.
 """
 
 from __future__ import annotations
@@ -117,26 +118,151 @@ def _parse_num(s: str) -> float | int | str:
 
 
 def scrape_packaging_el_table(page: Page) -> list[dict[str, Any]]:
-    rows = page.locator(
-        ".el-table__body-wrapper.is-scrolling-none tbody tr.el-table__row"
+    """Read the PDP packaging Element table (Model, Box, …).
+
+    The grid is the ``div.row.mt-4`` immediately **after** ``.model-info-box`` (not other
+    ``.row.mt-4`` carousels). Read **only** ``.el-table > .el-table__body-wrapper`` rows —
+    not ``.el-table__fixed-body-wrapper``, where Box/price cells are ``is-hidden`` and
+    often scrape empty. Use ``textContent`` for cells (includes hidden model column).
+    """
+
+    def _cell_text(td_loc: Any) -> str:
+        inner = td_loc.locator(".cell").first
+        if inner.count():
+            raw = inner.text_content()
+        else:
+            raw = td_loc.text_content()
+        return _text_clean(raw or "")
+
+    def _main_body_rows(el_table: Any) -> Any:
+        """Direct scroll body only (sibling of .el-table__fixed), not the fixed clone."""
+        return el_table.locator(":scope > .el-table__body-wrapper tbody tr.el-table__row")
+
+    row_after_specs = page.locator(".model-info-box ~ div.row.mt-4").filter(
+        has=page.locator("th", has_text=re.compile(r"Model", re.I))
     )
+    row_any_mt4 = page.locator("div.row.mt-4").filter(
+        has=page.locator("th", has_text=re.compile(r"Model", re.I))
+    )
+
+    try:
+        row_after_specs.first.scroll_into_view_if_needed(timeout=5_000)
+    except Exception:
+        try:
+            row_any_mt4.first.scroll_into_view_if_needed(timeout=5_000)
+        except Exception:
+            pass
+
+    try:
+        page.wait_for_function(
+            """() => {
+              const table = document.querySelector(
+                '.model-info-box ~ div.row.mt-4 div.el-table'
+              ) || document.querySelector('div.row.mt-4 div.el-table');
+              if (!table) return false;
+              const wrap = table.querySelector(':scope > .el-table__body-wrapper tbody');
+              if (!wrap) return false;
+              const tr = wrap.querySelector('tr.el-table__row');
+              if (!tr) return false;
+              const tds = tr.querySelectorAll('td');
+              if (tds.length < 8) return false;
+              const box = (tds[1].textContent || '').trim();
+              return box.length > 0;
+            }""",
+            timeout=20_000,
+        )
+    except Exception:
+        try:
+            page.wait_for_selector(
+                ".model-info-box ~ div.row.mt-4 div.el-table > .el-table__body-wrapper "
+                "tbody tr.el-table__row",
+                state="attached",
+                timeout=12_000,
+            )
+        except Exception:
+            try:
+                page.wait_for_selector(
+                    "div.row.mt-4 div.el-table > .el-table__body-wrapper "
+                    "tbody tr.el-table__row",
+                    state="attached",
+                    timeout=8_000,
+                )
+            except Exception:
+                pass
+
+    el_near = row_after_specs.locator("div.el-table").first
+    el_wide = row_any_mt4.locator("div.el-table").first
+
+    row_locator_candidates: list[Any] = [
+        _main_body_rows(el_near),
+        _main_body_rows(el_wide),
+        page.locator(
+            ".model-info-box ~ div.row.mt-4 div.el-table > .el-table__body-wrapper "
+            "tbody tr.el-table__row"
+        ),
+        page.locator(
+            "div.row.mt-4 div.el-table > .el-table__body-wrapper tbody tr.el-table__row"
+        ),
+        page.locator("div.el-table > .el-table__body-wrapper tbody tr.el-table__row"),
+        row_any_mt4.locator(".el-table__fixed-body-wrapper tbody tr.el-table__row"),
+        page.locator("table.el-table__body tbody tr.el-table__row"),
+    ]
+
+    def _pick_best(candidates: list[Any]) -> tuple[Any, int]:
+        best_r: Any = candidates[-1]
+        best_score = -1
+        best_fill = -1
+        for rloc in candidates:
+            try:
+                cnt = rloc.count()
+            except Exception:
+                continue
+            score = 0
+            fill0 = 0
+            for ri in range(min(cnt, 50)):
+                tr = rloc.nth(ri)
+                if tr.locator("td").count() < 8:
+                    continue
+                score += 1
+                if ri == 0:
+                    for ci in range(1, 8):
+                        if _cell_text(tr.locator("td").nth(ci)):
+                            fill0 += 1
+            if score > best_score or (
+                score == best_score and score > 0 and fill0 > best_fill
+            ):
+                best_score = score
+                best_fill = fill0
+                best_r = rloc
+        return best_r, best_score
+
+    rows, best_score = _pick_best(row_locator_candidates)
+    if best_score <= 0:
+        rows = page.locator("tbody tr.el-table__row")
+
     out: list[dict[str, Any]] = []
+    seen_row_models: set[str] = set()
     n = rows.count()
     for i in range(n):
         tr = rows.nth(i)
-        cells = tr.locator("td .cell")
-        if cells.count() < 8:
+        tds = tr.locator("td")
+        if tds.count() < 8:
             continue
-        model = _text_clean(cells.nth(0).inner_text())
+        model = _cell_text(tds.nth(0))
         if not model:
             continue
-        box_raw = _text_clean(cells.nth(1).inner_text())
-        desc = _text_clean(cells.nth(2).inner_text())
-        cu = _text_clean(cells.nth(3).inner_text())
-        gw = _text_clean(cells.nth(4).inner_text())
-        nw = _text_clean(cells.nth(5).inner_text())
-        pkg = _text_clean(cells.nth(6).inner_text())
-        unit = _text_clean(cells.nth(7).inner_text())
+        mk = _norm_sku_match(model)
+        if mk in seen_row_models:
+            continue
+        seen_row_models.add(mk)
+
+        box_raw = _cell_text(tds.nth(1))
+        desc = _cell_text(tds.nth(2))
+        cu = _cell_text(tds.nth(3))
+        gw = _cell_text(tds.nth(4))
+        nw = _cell_text(tds.nth(5))
+        pkg = _cell_text(tds.nth(6))
+        unit = _cell_text(tds.nth(7))
 
         box_v: Any = _parse_num(box_raw)
         if isinstance(box_v, str) and box_v != "":
@@ -147,7 +273,7 @@ def scrape_packaging_el_table(page: Page) -> list[dict[str, Any]]:
 
         out.append(
             {
-                "sub-sku": model,
+                "model": model,
                 "box": box_v,
                 "description": desc,
                 "cuFt": _parse_num(cu),
@@ -169,32 +295,82 @@ def _extras_from_singles_scrape(scrape: dict[str, str]) -> dict[str, str]:
     return o
 
 
+def _attributes_ordered_with_sources(
+    sub_skus: list[str],
+    table_rows: list[dict[str, Any]],
+    singles_by_sku: dict[str, dict[str, str]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Build ordered attribute dicts plus one log line per Sub-SKU (source: table / singles / model-only)."""
+    by_model: dict[str, dict[str, Any]] = {}
+    for tr in table_rows:
+        m = str(tr.get("model") or tr.get("sub-sku") or "").strip()
+        if not m:
+            continue
+        row_clean = {k: v for k, v in tr.items() if k != "sub-sku"}
+        row_clean["model"] = m
+        key = _norm_sku_match(m)
+        by_model[key] = dict(row_clean)
+
+    ordered: list[dict[str, Any]] = []
+    log_lines: list[str] = []
+    for sub in sub_skus:
+        km = _norm_sku_match(sub)
+        row_hit = by_model.get(km)
+        if row_hit is not None:
+            ordered.append(dict(row_hit))
+            log_lines.append(f"{sub} → packaging table (model match)")
+        elif km in singles_by_sku:
+            cell = {"model": sub}
+            cell.update(_extras_from_singles_scrape(singles_by_sku[km]))
+            ordered.append(cell)
+            log_lines.append(f"{sub} → singles file merge (no table row)")
+        else:
+            ordered.append({"model": sub})
+            log_lines.append(f"{sub} → model only (no table match, not in singles)")
+    return ordered, log_lines
+
+
 def build_attributes_json(
     sub_skus: list[str],
     table_rows: list[dict[str, Any]],
     singles_by_sku: dict[str, dict[str, str]],
 ) -> str:
-    by_model: dict[str, dict[str, Any]] = {}
-    for tr in table_rows:
-        m = str(tr.get("sub-sku") or "").strip()
-        if not m:
-            continue
-        by_model[_norm_sku_match(m)] = tr
+    """One JSON object per Sub-SKU (sheet order).
 
-    ordered: list[dict[str, Any]] = []
-    for sub in sub_skus:
-        km = _norm_sku_match(sub)
-        if km in by_model:
-            row = dict(by_model[km])
-            row["sub-sku"] = str(row.get("sub-sku") or sub).strip() or sub
-            ordered.append(row)
-        elif km in singles_by_sku:
-            cell: dict[str, Any] = {"sub-sku": sub}
-            cell.update(_extras_from_singles_scrape(singles_by_sku[km]))
-            ordered.append(cell)
-        else:
-            ordered.append({"sub-sku": sub})
+    Simple rule: normalize sheet Sub-SKU and table Model the same way (``_norm_sku_match``).
+    If they match → full packaging row from HTML (model, box, description, …).
+    Else if that Sub-SKU exists in singles output → merge singles extras under ``model``.
+    Else → ``{"model": "<sub>"}`` only.
+    """
+    ordered, _ = _attributes_ordered_with_sources(sub_skus, table_rows, singles_by_sku)
     return json.dumps(ordered, ensure_ascii=False)
+
+
+def log_attributes_breakdown(
+    sub_skus: list[str],
+    table_rows: list[dict[str, Any]],
+    singles_by_sku: dict[str, dict[str, str]],
+    *,
+    mode: str,
+) -> None:
+    """Log how each Sub-SKU was resolved for the ``attributes`` column."""
+    if not sub_skus:
+        return
+    _, lines = _attributes_ordered_with_sources(sub_skus, table_rows, singles_by_sku)
+    log.info(
+        "[cyan]attributes[/] [%s] %d Sub-SKU(s) — per-item source:",
+        mode,
+        len(sub_skus),
+    )
+    for ln in lines:
+        log.info("  [dim]•[/] %s", _esc(ln))
+    if table_rows:
+        models = [str(r.get("model") or "").strip() for r in table_rows if r.get("model")]
+        log.info(
+            "  [dim]packaging table on page:[/] [white]%d[/] row(s) — models [dim]%s[/]",
+            len(table_rows),
+            _esc(", ".join(models) if models else "(none)"),
+        )
 
 
 def _read_header_row(ws: Any) -> list[str]:
@@ -431,10 +607,14 @@ def run(
                 append_narrow_multi_row(ws_narrow, next_narrow, base_header, row, attrs)
                 wb_narrow.save(path_narrow)
                 log.info(
-                    "[bold green]Multi (singles-only)[/] [cyan]%d[/]/[white]%d[/] | Sub-SKUs [dim]%s[/]",
+                    "[bold green]Multi (singles-only)[/] [cyan]%d[/]/[white]%d[/] | Sub-SKUs [dim]%s[/] "
+                    "[dim](no site — attributes from singles merge / model-only)[/]",
                     job_i,
                     len(jobs_s),
                     _esc(", ".join(sub_skus)),
+                )
+                log_attributes_breakdown(
+                    sub_skus, [], singles_by_sku, mode="singles-only (no scrape)"
                 )
                 next_narrow += 1
         finally:
@@ -473,7 +653,8 @@ def run(
                 job_i += 1
                 log.info(
                     "[bold magenta]Multi (web)[/] [cyan]%d[/]/[white]%d[/] | Master [yellow]%s[/] "
-                    "| search [green]%s[/] | Sub-SKUs [dim]%s[/]",
+                    "| search [green]%s[/] | Sub-SKUs [dim]%s[/] "
+                    "[dim](will scrape site if search succeeds)[/]",
                     job_i,
                     len(jobs_w),
                     _esc(master_display or ""),
@@ -487,6 +668,9 @@ def run(
                     data["attributes"] = json.dumps([], ensure_ascii=False)
                     append_scrape_row(ws_web, next_web, n_base, row, data, ok=False, error=err)
                     wb_web.save(path_web)
+                    log.info(
+                        "[yellow]attributes[/] [web (invalid Sub-SKU cell)] — empty list, not scraped"
+                    )
                     next_web += 1
                     time.sleep(setting.DELAY_BETWEEN_SKUS_SEC)
                     continue
@@ -497,6 +681,9 @@ def run(
                     data["attributes"] = build_attributes_json(sub_skus, [], singles_by_sku)
                     append_scrape_row(ws_web, next_web, n_base, row, data, ok=False, error=err)
                     wb_web.save(path_web)
+                    log_attributes_breakdown(
+                        sub_skus, [], singles_by_sku, mode="web (skipped — empty master)"
+                    )
                     next_web += 1
                     time.sleep(setting.DELAY_BETWEEN_SKUS_SEC)
                     continue
@@ -506,7 +693,10 @@ def run(
                     search_sku(page, search_term)
                     log.info("[blue]Search[/] → [green]results[/] — exact card…")
                     if click_exact_product_card(page, search_term):
-                        log.info("[bold green]PDP[/] → scrape + packaging table…")
+                        log.info(
+                            "[bold magenta]SCRAPING[/] PDP + packaging table in browser "
+                            "(product fields + Element grid)…"
+                        )
                         pdata = scrape_product_page(page, origin)
                         table = scrape_packaging_el_table(page)
                         pdata["attributes"] = build_attributes_json(
@@ -514,8 +704,11 @@ def run(
                         )
                         append_scrape_row(ws_web, next_web, n_base, row, pdata, ok=True)
                         web_rows_ok += 1
+                        log_attributes_breakdown(
+                            sub_skus, table, singles_by_sku, mode="web scrape (ok)"
+                        )
                         log.info(
-                            "[bold green]XLSX[/] row [cyan]%d[/] | table rows=[white]%d[/]",
+                            "[bold green]XLSX[/] row [cyan]%d[/] | scraped packaging rows=[white]%d[/]",
                             next_web,
                             len(table),
                         )
@@ -531,6 +724,9 @@ def run(
                         next_web += 1
                         wb_web.save(path_web)
                         log.warning("[red]%s[/] — [yellow]%s[/]", err, _esc(search_term))
+                        log_attributes_breakdown(
+                            sub_skus, [], singles_by_sku, mode="web (no PDP — not scraped)"
+                        )
                 except Exception as e:  # noqa: BLE001
                     err = str(e)
                     data = dict(empty_scrape)
@@ -542,6 +738,9 @@ def run(
                         "[bold red]ERROR[/] — Master [yellow]%s[/]: [red]%s[/]",
                         _esc(search_term),
                         _esc(err),
+                    )
+                    log_attributes_breakdown(
+                        sub_skus, [], singles_by_sku, mode="web (error — not scraped)"
                     )
                     try:
                         page.goto(origin + "/", wait_until="domcontentloaded")
