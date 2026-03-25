@@ -29,10 +29,29 @@ LIVE_SUCCESS_XLSX_DIR = (
     HOMETOOL_DIR.parent / "sheets" / "Homelagance" / "scrppedSheets"
 )
 # Resolves to: .../ProductsScrapper/sheets/Homelagance/scrppedSheets
-# File name per run: Homelagance-YYYYMMDD_HHMMSS-scrapped-products.xlsx
+# Per run (same stamp across singles + multiples). strftime pattern: dd-mm-yy_HHMMSS
+# (slashes not used — invalid in Windows paths.)
+RUN_FILE_STAMP_FORMAT = "%d-%m-%y_%H%M%S"
+#   Homelagance-{stamp}-single-subskus-sheets.xlsx
+#   Homelagance-{stamp}-multiple-subskus-from-singles.xlsx  (all Sub-SKUs found in singles)
+#   Homelagance-{stamp}-multiple-subskus-sheets.xlsx        (site scrape by master SKU)
+
+# Multi rows resolved only from singles file: these base columns + attributes (JSON).
+MULTI_NARROW_BASE_HEADERS: list[str] = [
+    "Brand Name",
+    "Category",
+    "Collection Name",
+    "Product Links",
+    "Single / Set Item",
+    "Ship Type",
+    "NEW/Master SKU",
+    "Sub-SKU",
+    "Comments",
+]
 
 # Column header in the base sheet (exact match)
 SUB_SKU_HEADER = "Sub-SKU"
+MASTER_SKU_HEADER = "NEW/Master SKU"
 
 # --- Playwright ---
 # False = visible browser window; True = run in background (no window).

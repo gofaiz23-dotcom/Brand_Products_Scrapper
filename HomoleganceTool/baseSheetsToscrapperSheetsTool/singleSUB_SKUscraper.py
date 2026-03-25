@@ -10,9 +10,9 @@ Flow (matches Homelegance dealer site + your base sheet):
    the PDP (#product_name, price, stock, description, images from #product_img / bpic_*,
    Weights & Dimensions / Product Details / Packaging from .model-info-box — not the
    "See more from … Collection" carousel).
-6. New workbook each run under sheets/Homelagance/scrppedSheets: headers
-   first, then only successfully scraped rows are appended and saved (live — open the
-   file while running to watch). Skipped / failed SKUs are not written to this file.
+6. New workbook each run under sheets/Homelagance/scrppedSheets:
+   Homelagance-dd-mm-yy_HHMMSS-single-subskus-sheets.xlsx — headers first, then only
+   successfully scraped rows (live save per OK). Skipped / failed SKUs are not written.
 """
 
 from __future__ import annotations
@@ -59,6 +59,7 @@ SCRAPED_COLUMN_KEYS: list[str] = [
     "Product Details",
     "Packaging",
     "Product page URL",
+    "attributes",
 ]
 
 
@@ -138,8 +139,9 @@ SCRAPE_COL_OFFSET: dict[str, int] = {
 
 
 def new_output_path() -> Path:
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return setting.LIVE_SUCCESS_XLSX_DIR / f"Homelagance-{stamp}-scrapped-products.xlsx"
+    stamp = datetime.now().strftime(setting.RUN_FILE_STAMP_FORMAT)
+    setting.LIVE_SUCCESS_XLSX_DIR.mkdir(parents=True, exist_ok=True)
+    return setting.LIVE_SUCCESS_XLSX_DIR / f"Homelagance-{stamp}-single-subskus-sheets.xlsx"
 
 
 def write_scrape_cells(
@@ -172,6 +174,26 @@ def init_success_only_workbook(
     return wb, ws, n_base
 
 
+def append_scrape_row(
+    ws: Worksheet,
+    excel_row: int,
+    n_base: int,
+    base_row: list[Any],
+    scrape_data: dict[str, str],
+    *,
+    ok: bool,
+    error: str = "",
+) -> None:
+    for j in range(n_base):
+        val = base_row[j] if j < len(base_row) else None
+        ws.cell(row=excel_row, column=j + 1, value=val)
+    merged = {k: "" for k in SCRAPED_COLUMN_KEYS}
+    merged.update(scrape_data)
+    merged["scrape_status"] = "ok" if ok else "failed"
+    merged["scrape_error"] = "" if ok else (error or "")
+    write_scrape_cells(ws, excel_row, n_base, merged)
+
+
 def append_success_row(
     ws: Worksheet,
     excel_row: int,
@@ -179,14 +201,7 @@ def append_success_row(
     base_row: list[Any],
     scrape_data: dict[str, str],
 ) -> None:
-    for j in range(n_base):
-        val = base_row[j] if j < len(base_row) else None
-        ws.cell(row=excel_row, column=j + 1, value=val)
-    merged = {k: "" for k in SCRAPED_COLUMN_KEYS}
-    merged.update(scrape_data)
-    merged["scrape_status"] = "ok"
-    merged["scrape_error"] = ""
-    write_scrape_cells(ws, excel_row, n_base, merged)
+    append_scrape_row(ws, excel_row, n_base, base_row, scrape_data, ok=True)
 
 
 def login_once(
@@ -238,7 +253,7 @@ def click_exact_product_card(page: Page, sku: str) -> bool:
             raw = name_el.inner_text()
         if raw is None:
             continue
-        if _norm_sku(raw) != target:
+        if _norm_sku(raw.rstrip("*")) != _norm_sku(target.rstrip("*")):
             continue
         link = card.locator("a.flex-fill").first
         if link.count():
@@ -402,10 +417,12 @@ def scrape_product_page(page: Page, origin: str) -> dict[str, str]:
         "Product Details": product_details,
         "Packaging": packaging,
         "Product page URL": page.url,
+        "attributes": "",
     }
 
 
-def run() -> Path:
+def run() -> tuple[Path, int, int, int]:
+    """Returns (output path, success rows written, attempts made, planned attempts)."""
     _load_env()
     login_url = os.environ.get("LOGIN_URL", "").strip()
     username = os.environ.get("USERNAME", "").strip()
@@ -555,19 +572,23 @@ def run() -> Path:
 
     successes = next_data_row - 2
     log.info(
-        "[bold white on green] ═══ Finished ═══ [/] "
-        "[green]success rows[/]=[bold]%d[/] | attempts [cyan]%d[/]/[white]%d[/] | file [magenta]%s[/]",
+        "[bold white on green] ═══ Singles finished ═══ [/] "
+        "[green]rows written[/]=[bold]%d[/] | attempts [cyan]%d[/]/[white]%d[/] | file [magenta]%s[/]",
         successes,
         single_sku_attempts,
         jobs_planned,
         out_path,
     )
-    return out_path
+    return out_path, successes, single_sku_attempts, jobs_planned
 
 
 if __name__ == "__main__":
     from log_theme import setup_colored_logging
 
     setup_colored_logging()
-    out = run()
-    log.info("[bold green]Run complete.[/] Output: [cyan]%s[/cyan]", out)
+    out_path, ok_rows, att, plan = run()
+    log.info(
+        "[bold green]Run complete.[/] [cyan]%s[/cyan] | rows written [bold]%d[/]",
+        out_path,
+        ok_rows,
+    )
