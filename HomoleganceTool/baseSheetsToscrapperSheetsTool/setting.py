@@ -28,6 +28,8 @@ def get_base_sheet_path() -> Path:
 LIVE_SUCCESS_XLSX_DIR = (
     HOMETOOL_DIR.parent / "sheets" / "Homelagance" / "scrppedSheets"
 )
+# Failed single Sub-SKU rows (base columns + Error reason); same stamp as singles file.
+MISSING_XLSX_DIR = HOMETOOL_DIR.parent / "sheets" / "Homelagance" / "Missing"
 # Resolves to: .../ProductsScrapper/sheets/Homelagance/scrppedSheets
 # Per run (same stamp across singles + multiples). strftime pattern: dd-mm-yy_HHMMSS
 # (slashes not used — invalid in Windows paths.)
@@ -48,6 +50,9 @@ MULTI_NARROW_BASE_HEADERS: list[str] = [
     "Sub-SKU",
     "Comments",
 ]
+
+# Missing report: same base columns as above + scrape failure reason.
+MISSING_SUB_SKU_HEADERS: list[str] = MULTI_NARROW_BASE_HEADERS + ["Error reason"]
 
 # Column header in the base sheet (exact match)
 SUB_SKU_HEADER = "Sub-SKU"

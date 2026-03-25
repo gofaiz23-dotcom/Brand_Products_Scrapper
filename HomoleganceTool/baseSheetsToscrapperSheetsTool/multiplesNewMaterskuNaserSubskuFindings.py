@@ -3,14 +3,17 @@ After singleSUB_SKUscraper.run() writes the singles xlsx:
 
 1. Re-read base sheet; rows where Sub-SKU contains a comma (multi).
 2. If every Sub-SKU in that cell exists in the singles output (ok rows) → no browser:
-   write one row to Homelagance-{stamp}-multiple-subskus-from-singles.xlsx with narrow
-   columns (MULTI_NARROW_BASE_HEADERS + attributes JSON from singles only).
+   write one row to Homelagance-{stamp}-multiple-subskus-from-singles.xlsx using the
+   same columns as singles / web multi (base sheet + scrape columns); only ``attributes``
+   is filled (JSON from singles merge); other scrape fields are blank, ``scrape_status`` ok.
 3. If any Sub-SKU is missing from singles → search NEW/Master SKU (strip HML-; 3+ segments
    drop last) on the site, scrape PDP + packaging table; write to
    Homelagance-{stamp}-multiple-subskus-sheets.xlsx (full base + scrape columns).
 4. Web scrape ok: attributes = JSON array in Sub-SKU sheet order; each item is the full packaging
    row when Model matches that Sub-SKU (simple normalized match), else singles merge, else {model}.
    No table / failed scrape: same merge logic with an empty table.
+5. Failed web multi rows are also appended to the same Missing xlsx as singles
+   (``missing_xlsx_path`` from ``run.py``), with Error reason prefixed ``Multi Sub-SKU —``.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from singleSUB_SKUscraper import (
     _norm_sku,
     _origin_from_login_url,
     _text_clean,
+    append_missing_report_row,
     append_scrape_row,
     click_exact_product_card,
     init_success_only_workbook,
@@ -452,46 +456,33 @@ def all_sub_skus_in_singles(
     return True
 
 
-def narrow_base_values(base_header: list[str], base_row: list[Any]) -> list[Any]:
-    out: list[Any] = []
-    for h in setting.MULTI_NARROW_BASE_HEADERS:
-        if h in base_header:
-            ix = base_header.index(h)
-            out.append(base_row[ix] if ix < len(base_row) else None)
-        else:
-            out.append("")
-    return out
-
-
-def append_narrow_multi_row(
-    ws: Any, excel_row: int, base_header: list[str], base_row: list[Any], attrs_json: str
+def _log_multi_missing(
+    missing_xlsx_path: Path | None,
+    base_header: list[str],
+    base_row: list[Any],
+    err: str,
 ) -> None:
-    vals = narrow_base_values(base_header, base_row)
-    for j, v in enumerate(vals, start=1):
-        ws.cell(row=excel_row, column=j, value=v)
-    ws.cell(row=excel_row, column=len(vals) + 1, value=attrs_json)
-
-
-def init_narrow_multiples_workbook(out_path: Path) -> tuple[Any, Any]:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    assert ws is not None
-    ws.title = "Sheet1"
-    headers = list(setting.MULTI_NARROW_BASE_HEADERS) + ["attributes"]
-    for j, h in enumerate(headers, start=1):
-        ws.cell(row=1, column=j, value=h)
-    wb.save(out_path)
-    return wb, ws
+    if not missing_xlsx_path:
+        return
+    append_missing_report_row(
+        missing_xlsx_path,
+        base_header,
+        base_row,
+        f"Multi Sub-SKU — {err}",
+    )
 
 
 def run(
     singles_xlsx_path: Path,
+    missing_xlsx_path: Path | None = None,
 ) -> tuple[Path | None, Path | None, int, int, int]:
     """
     Reads singles scrape output; writes up to two workbooks (same stamp as singles file).
+    ``missing_xlsx_path``: same Missing xlsx as singles; failed web multi rows are appended there.
+
     Returns (narrow_path, web_path, narrow_rows, web_rows_total, web_rows_ok).
-    web_rows_ok is scrape_status ok on the web workbook; narrow has no status column (all count).
+    web_rows_ok is scrape_status ok on the web workbook; from-singles rows use the same
+    sheet layout as singles (including ``scrape_status`` ok).
     """
     _load_env()
     login_url = os.environ.get("LOGIN_URL", "").strip()
@@ -538,7 +529,7 @@ def run(
             jobs_planned,
         )
     log.info(
-        "[dim]Narrow (all in singles)[/] → [magenta]%s[/]",
+        "[dim]From-singles multi[/] (same columns as singles/web) → [magenta]%s[/]",
         path_narrow.name,
     )
     log.info("[dim]Full scrape (needs site)[/] → [magenta]%s[/]", path_web.name)
@@ -598,13 +589,16 @@ def run(
 
     if jobs_s:
         path_out_narrow = path_narrow
-        wb_narrow, ws_narrow = init_narrow_multiples_workbook(path_narrow)
+        wb_narrow, ws_narrow, _ = init_success_only_workbook(path_narrow, base_header)
         try:
             job_i = 0
             for row, sub_skus in jobs_s:
                 job_i += 1
                 attrs = build_attributes_json(sub_skus, [], singles_by_sku)
-                append_narrow_multi_row(ws_narrow, next_narrow, base_header, row, attrs)
+                narrow_scrape = {"attributes": attrs}
+                append_scrape_row(
+                    ws_narrow, next_narrow, n_base, row, narrow_scrape, ok=True
+                )
                 wb_narrow.save(path_narrow)
                 log.info(
                     "[bold green]Multi (singles-only)[/] [cyan]%d[/]/[white]%d[/] | Sub-SKUs [dim]%s[/] "
@@ -668,6 +662,7 @@ def run(
                     data["attributes"] = json.dumps([], ensure_ascii=False)
                     append_scrape_row(ws_web, next_web, n_base, row, data, ok=False, error=err)
                     wb_web.save(path_web)
+                    _log_multi_missing(missing_xlsx_path, base_header, row, err)
                     log.info(
                         "[yellow]attributes[/] [web (invalid Sub-SKU cell)] — empty list, not scraped"
                     )
@@ -681,6 +676,7 @@ def run(
                     data["attributes"] = build_attributes_json(sub_skus, [], singles_by_sku)
                     append_scrape_row(ws_web, next_web, n_base, row, data, ok=False, error=err)
                     wb_web.save(path_web)
+                    _log_multi_missing(missing_xlsx_path, base_header, row, err)
                     log_attributes_breakdown(
                         sub_skus, [], singles_by_sku, mode="web (skipped — empty master)"
                     )
@@ -723,6 +719,7 @@ def run(
                         append_scrape_row(ws_web, next_web, n_base, row, data, ok=False, error=err)
                         next_web += 1
                         wb_web.save(path_web)
+                        _log_multi_missing(missing_xlsx_path, base_header, row, err)
                         log.warning("[red]%s[/] — [yellow]%s[/]", err, _esc(search_term))
                         log_attributes_breakdown(
                             sub_skus, [], singles_by_sku, mode="web (no PDP — not scraped)"
@@ -734,6 +731,7 @@ def run(
                     append_scrape_row(ws_web, next_web, n_base, row, data, ok=False, error=err)
                     next_web += 1
                     wb_web.save(path_web)
+                    _log_multi_missing(missing_xlsx_path, base_header, row, err)
                     log.warning(
                         "[bold red]ERROR[/] — Master [yellow]%s[/]: [red]%s[/]",
                         _esc(search_term),

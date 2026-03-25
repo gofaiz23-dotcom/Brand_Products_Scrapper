@@ -3,7 +3,7 @@ Entry point: singles scraper, then multi Sub-SKU pass (split outputs).
 
 Outputs under sheets/Homelagance/scrppedSheets (same stamp dd-mm-yy_HHMMSS):
   Homelagance-{stamp}-single-subskus-sheets.xlsx
-  Homelagance-{stamp}-multiple-subskus-from-singles.xlsx  (optional)
+  Homelagance-{stamp}-multiple-subskus-from-singles.xlsx  (optional; same columns as singles)
   Homelagance-{stamp}-multiple-subskus-sheets.xlsx        (optional)
 
 Run (from this folder):
@@ -24,8 +24,12 @@ from singleSUB_SKUscraper import run as run_singles  # noqa: E402
 
 
 if __name__ == "__main__":
-    singles_path, singles_rows, singles_att, singles_plan = run_singles()
-    narrow_path, web_path, narrow_rows, web_rows, web_ok = run_multiples(singles_path)
+    singles_path, singles_rows, singles_att, singles_plan, missing_path, missing_n = (
+        run_singles()
+    )
+    narrow_path, web_path, narrow_rows, web_rows, web_ok = run_multiples(
+        singles_path, missing_path
+    )
 
     total_rows = singles_rows + narrow_rows + web_rows
 
@@ -42,9 +46,15 @@ if __name__ == "__main__":
         singles_att,
         singles_plan,
     )
+    logging.info(
+        "[yellow]Singles missing[/]: [bold]%d[/] row(s) → [cyan]%s[/]",
+        missing_n,
+        missing_path,
+    )
     if narrow_rows and narrow_path:
         logging.info(
-            "[green]Multiples (from singles only)[/]: [bold]%d[/] rows → [cyan]%s[/]",
+            "[green]Multiples (from singles only, same sheet columns as singles)[/]: "
+            "[bold]%d[/] rows → [cyan]%s[/]",
             narrow_rows,
             narrow_path,
         )

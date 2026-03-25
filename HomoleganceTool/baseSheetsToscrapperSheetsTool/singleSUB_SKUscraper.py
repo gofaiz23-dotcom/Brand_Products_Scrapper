@@ -12,7 +12,10 @@ Flow (matches Homelegance dealer site + your base sheet):
    "See more from … Collection" carousel).
 6. New workbook each run under sheets/Homelagance/scrppedSheets:
    Homelagance-dd-mm-yy_HHMMSS-single-subskus-sheets.xlsx — headers first, then only
-   successfully scraped rows (live save per OK). Skipped / failed SKUs are not written.
+   successfully scraped rows (live save per OK).
+7. Failed single Sub-SKU attempts (no exact card, timeout, etc.) append one row to
+   sheets/Homelagance/Missing/Homelagance-{same-stamp}-missing-subskus.xlsx with
+   Brand Name … Sub-SKU, Comments, and Error reason.
 """
 
 from __future__ import annotations
@@ -138,10 +141,72 @@ SCRAPE_COL_OFFSET: dict[str, int] = {
 }
 
 
-def new_output_path() -> Path:
+def live_singles_and_missing_paths() -> tuple[Path, Path, str]:
+    """Same run stamp for success xlsx (scrppedSheets) and missing xlsx (Missing)."""
     stamp = datetime.now().strftime(setting.RUN_FILE_STAMP_FORMAT)
     setting.LIVE_SUCCESS_XLSX_DIR.mkdir(parents=True, exist_ok=True)
-    return setting.LIVE_SUCCESS_XLSX_DIR / f"Homelagance-{stamp}-single-subskus-sheets.xlsx"
+    setting.MISSING_XLSX_DIR.mkdir(parents=True, exist_ok=True)
+    singles = (
+        setting.LIVE_SUCCESS_XLSX_DIR / f"Homelagance-{stamp}-single-subskus-sheets.xlsx"
+    )
+    missing = setting.MISSING_XLSX_DIR / f"Homelagance-{stamp}-missing-subskus.xlsx"
+    return singles, missing, stamp
+
+
+def init_missing_workbook(out_path: Path) -> tuple[Workbook, Worksheet]:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    ws = wb.active
+    assert ws is not None
+    ws.title = "Sheet1"
+    for j, h in enumerate(setting.MISSING_SUB_SKU_HEADERS, start=1):
+        ws.cell(row=1, column=j, value=h)
+    wb.save(out_path)
+    return wb, ws
+
+
+def append_missing_row(
+    ws: Worksheet,
+    excel_row: int,
+    base_header: list[str],
+    base_row: list[Any],
+    error_reason: str,
+) -> None:
+    """Map base sheet columns into MISSING_SUB_SKU_HEADERS (except Error reason)."""
+    err = (error_reason or "").strip()
+    if len(err) > 32000:
+        err = err[:32000] + "…"
+    headers = setting.MISSING_SUB_SKU_HEADERS
+    for j, col_name in enumerate(headers[:-1], start=1):
+        if col_name in base_header:
+            ix = base_header.index(col_name)
+            val = base_row[ix] if ix < len(base_row) else None
+        else:
+            val = None
+        ws.cell(row=excel_row, column=j, value=val)
+    ws.cell(row=excel_row, column=len(headers), value=err)
+
+
+def append_missing_report_row(
+    missing_path: Path,
+    base_header: list[str],
+    base_row: list[Any],
+    error_reason: str,
+) -> None:
+    """Append one row to the Missing workbook (creates file + headers if absent)."""
+    missing_path.parent.mkdir(parents=True, exist_ok=True)
+    if not missing_path.is_file():
+        wb0, _ = init_missing_workbook(missing_path)
+        wb0.close()
+    wb = openpyxl.load_workbook(missing_path)
+    try:
+        ws = wb.active
+        assert ws is not None
+        r = ws.max_row + 1
+        append_missing_row(ws, r, base_header, base_row, error_reason)
+        wb.save(missing_path)
+    finally:
+        wb.close()
 
 
 def write_scrape_cells(
@@ -421,8 +486,8 @@ def scrape_product_page(page: Page, origin: str) -> dict[str, str]:
     }
 
 
-def run() -> tuple[Path, int, int, int]:
-    """Returns (output path, success rows written, attempts made, planned attempts)."""
+def run() -> tuple[Path, int, int, int, Path, int]:
+    """Returns (singles xlsx, ok rows, attempts, planned, missing xlsx, missing rows)."""
     _load_env()
     login_url = os.environ.get("LOGIN_URL", "").strip()
     username = os.environ.get("USERNAME", "").strip()
@@ -479,11 +544,18 @@ def run() -> tuple[Path, int, int, int]:
         )
     log.info("[blue]Site[/] → [underline cyan]%s[/underline cyan]", _esc(origin))
 
-    out_path = new_output_path()
+    out_path, missing_path, _stamp = live_singles_and_missing_paths()
     log.info("[green]Live xlsx[/] (success rows only) → [cyan]%s[/cyan]", out_path)
+    log.info(
+        "[yellow]Missing[/] (failed Sub-SKUs) → [cyan]%s[/cyan]",
+        missing_path,
+    )
     wb, ws, n_base = init_success_only_workbook(out_path, base_header)
+    wb_miss, ws_miss = init_missing_workbook(missing_path)
     log.info("[dim]Workbook ready[/] [bold](headers only)[/] — rows append + save after each [green]OK[/]")
     next_data_row = 2
+    next_missing_row = 2
+    missing_count = 0
 
     single_sku_attempts = 0
 
@@ -548,18 +620,29 @@ def run() -> tuple[Path, int, int, int]:
                     next_data_row += 1
                     wb.save(out_path)
                 else:
+                    reason = "Single Sub-SKU — No exact product card match in search results"
                     log.warning(
                         "[bold red]FAIL[/] — no exact card for Sub-SKU [yellow]%s[/] "
-                        "[dim](not written to xlsx)[/]",
+                        "[dim](logged to missing xlsx)[/]",
                         _esc(sku),
                     )
+                    append_missing_row(ws_miss, next_missing_row, base_header, row, reason)
+                    next_missing_row += 1
+                    missing_count += 1
+                    wb_miss.save(missing_path)
             except Exception as e:  # noqa: BLE001
+                detail = str(e)
+                reason = f"Single Sub-SKU — {detail}"
                 log.warning(
                     "[bold red]ERROR[/] — Sub-SKU [yellow]%s[/]: [red]%s[/] "
-                    "[dim](not written to xlsx)[/]",
+                    "[dim](logged to missing xlsx)[/]",
                     _esc(sku),
-                    _esc(str(e)),
+                    _esc(detail),
                 )
+                append_missing_row(ws_miss, next_missing_row, base_header, row, reason)
+                next_missing_row += 1
+                missing_count += 1
+                wb_miss.save(missing_path)
                 try:
                     page.goto(origin + "/", wait_until="domcontentloaded")
                 except Exception:
@@ -570,25 +653,31 @@ def run() -> tuple[Path, int, int, int]:
         context.close()
         browser.close()
 
+    wb_miss.close()
+    wb.close()
+
     successes = next_data_row - 2
     log.info(
         "[bold white on green] ═══ Singles finished ═══ [/] "
-        "[green]rows written[/]=[bold]%d[/] | attempts [cyan]%d[/]/[white]%d[/] | file [magenta]%s[/]",
+        "[green]rows written[/]=[bold]%d[/] | [yellow]missing logged[/]=[bold]%d[/] | "
+        "attempts [cyan]%d[/]/[white]%d[/] | file [magenta]%s[/]",
         successes,
+        missing_count,
         single_sku_attempts,
         jobs_planned,
         out_path,
     )
-    return out_path, successes, single_sku_attempts, jobs_planned
+    return out_path, successes, single_sku_attempts, jobs_planned, missing_path, missing_count
 
 
 if __name__ == "__main__":
     from log_theme import setup_colored_logging
 
     setup_colored_logging()
-    out_path, ok_rows, att, plan = run()
+    out_path, ok_rows, att, plan, miss_path, miss_n = run()
     log.info(
-        "[bold green]Run complete.[/] [cyan]%s[/cyan] | rows written [bold]%d[/]",
+        "[bold green]Run complete.[/] [cyan]%s[/cyan] | rows written [bold]%d[/] | missing [yellow]%d[/]",
         out_path,
         ok_rows,
+        miss_n,
     )
